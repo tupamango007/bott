@@ -2,7 +2,6 @@ import asyncio
 import io
 import os
 import re
-import sqlite3
 import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, CommandHandler, ContextTypes as TGContext
@@ -20,7 +19,6 @@ LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", 0))
 
 PREFIX = "📢 "
 IGNORE_WORDS = ["спам", "реклама"]
-# Список запрещённых доменов (сообщения, содержащие ссылки на них, будут игнорироваться)
 BLOCKED_DOMAINS = ["example.com", "bad-site.net", "spam-link.org"]  # замените на свои
 
 ALLOWED_USERS = []          # пусто – все разрешены
@@ -31,8 +29,8 @@ ALBUM_TIMEOUT = 0.5
 
 ADMIN_IDS = []              # ID пользователей Telegram для команд (пусто – всем)
 bot_paused = False
+IGNORE_USERS = []           # чёрный список (хранится в памяти)
 
-# Статистика (сбрасывается при перезапуске)
 stats = {
     'messages_processed': 0,
     'files_processed': 0,
@@ -47,45 +45,6 @@ album_lock = asyncio.Lock()
 intents = discord.Intents.default()
 intents.message_content = True
 discord_client = commands.Bot(command_prefix="!", intents=intents)
-
-# ---------- Инициализация SQLite (для постоянного хранения чёрного списка) ----------
-DB_PATH = "bot_data.db"
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS banned_users (
-            user_id INTEGER PRIMARY KEY
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-def add_banned_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)', (user_id,))
-    conn.commit()
-    conn.close()
-
-def remove_banned_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM banned_users WHERE user_id = ?', (user_id,))
-    conn.commit()
-    conn.close()
-
-def get_banned_users():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id FROM banned_users')
-    users = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return users
-
-# Загружаем чёрный список при старте (можно не хранить в памяти, но для скорости загрузим)
-IGNORE_USERS = get_banned_users()  # теперь список загружается из БД
 
 # ---------- Функция отправки логов в Discord ----------
 async def send_log(message, level="INFO"):
@@ -108,10 +67,8 @@ def remove_links(text):
     """Удаляет все URL-ссылки из текста (аккуратное регулярное выражение)."""
     if not text:
         return text
-    # Более точное выражение: ищет http://, https://, www., t.me/, и домены вида example.com
     url_pattern = re.compile(r'https?://\S+|www\.\S+|t\.me/\S+|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/\S*)?')
     cleaned = url_pattern.sub('', text)
-    # Удаляем лишние пробелы
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned
 
@@ -149,7 +106,6 @@ def format_text_with_entities(text, entities):
             result[start:end] = f"```{substring}```"
         elif entity.type == 'text_link':
             result[start:end] = f"[{substring}]({entity.url})"
-        # Остальные типы (url, mention и др.) не преобразуем
     return ''.join(result)
 
 def get_forward_link(msg):
@@ -179,7 +135,6 @@ def get_sender_info(user):
     name = user.full_name
     username = f"(@{user.username})" if user.username else ""
     sender = f"**{name}** {username}".strip()
-    # Удаляем ссылки из имени отправителя (на всякий случай)
     sender = remove_links(sender)
     return sender
 
@@ -250,7 +205,6 @@ async def send_album(media_group_id, channel):
                 caption = format_text_with_entities(caption, msg.entities)
             if msg.caption_entities:
                 caption = format_text_with_entities(caption, msg.caption_entities)
-            # Удаляем ссылки из подписи
             caption = remove_links(caption)
 
         if msg.photo:
@@ -341,7 +295,6 @@ async def send_single_message(msg, channel, context):
         caption = format_text_with_entities(caption, msg.entities)
     if msg.caption_entities:
         caption = format_text_with_entities(caption, msg.caption_entities)
-    # Удаляем ссылки из текста сообщения
     caption = remove_links(caption)
 
     file_data = None
@@ -349,7 +302,6 @@ async def send_single_message(msg, channel, context):
     filename = None
     link = None
 
-    # Определяем тип вложения
     if msg.photo:
         photo = msg.photo[-1]
         file_data = await download_file(photo.file_id, context.bot)
@@ -383,7 +335,6 @@ async def send_single_message(msg, channel, context):
         filename = f"sticker.{ext}"
         link = get_message_link(msg)
 
-    # Проверка на запрещённые домены (если текст содержит ссылку на плохой домен – игнорируем)
     if contains_blocked_domain(caption, BLOCKED_DOMAINS):
         print(f"🚫 Игнорируем сообщение от {msg.from_user.id}: обнаружен запрещённый домен.")
         return
@@ -453,27 +404,31 @@ async def show_stats(ctx):
 
 @discord_client.command()
 async def ban(ctx, user_id: int):
+    global IGNORE_USERS
     if not ctx.author.guild_permissions.administrator:
         await ctx.send("❌ Недостаточно прав.")
         return
-    add_banned_user(user_id)
-    global IGNORE_USERS
-    IGNORE_USERS = get_banned_users()  # обновляем список в памяти
-    await ctx.send(f"✅ Пользователь {user_id} добавлен в чёрный список.")
-    await send_log(f"Забанен пользователь Telegram {user_id}", "INFO")
+    if user_id not in IGNORE_USERS:
+        IGNORE_USERS.append(user_id)
+        await ctx.send(f"✅ Пользователь {user_id} добавлен в чёрный список.")
+        await send_log(f"Забанен пользователь Telegram {user_id}", "INFO")
+    else:
+        await ctx.send(f"⚠️ Пользователь {user_id} уже в чёрном списке.")
 
 @discord_client.command()
 async def unban(ctx, user_id: int):
+    global IGNORE_USERS
     if not ctx.author.guild_permissions.administrator:
         await ctx.send("❌ Недостаточно прав.")
         return
-    remove_banned_user(user_id)
-    global IGNORE_USERS
-    IGNORE_USERS = get_banned_users()
-    await ctx.send(f"✅ Пользователь {user_id} удалён из чёрного списка.")
-    await send_log(f"Разбанен пользователь Telegram {user_id}", "INFO")
+    if user_id in IGNORE_USERS:
+        IGNORE_USERS.remove(user_id)
+        await ctx.send(f"✅ Пользователь {user_id} удалён из чёрного списка.")
+        await send_log(f"Разбанен пользователь Telegram {user_id}", "INFO")
+    else:
+        await ctx.send(f"⚠️ Пользователь {user_id} не найден в чёрном списке.")
 
-# ---------- Слеш-команды Discord (с deferred) ----------
+# ---------- Слеш-команды Discord ----------
 @discord_client.tree.command(name="pause", description="Приостановить пересылку")
 async def slash_pause(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
@@ -509,6 +464,7 @@ async def slash_show_stats(interaction: discord.Interaction):
 @discord_client.tree.command(name="ban", description="Забанить пользователя Telegram по ID")
 async def slash_ban(interaction: discord.Interaction, user_id: str):
     await interaction.response.defer(ephemeral=False)
+    global IGNORE_USERS
     if not interaction.user.guild_permissions.administrator:
         await interaction.followup.send("❌ Недостаточно прав.", ephemeral=True)
         return
@@ -517,15 +473,17 @@ async def slash_ban(interaction: discord.Interaction, user_id: str):
     except ValueError:
         await interaction.followup.send("❌ ID должен быть числом.", ephemeral=True)
         return
-    add_banned_user(uid)
-    global IGNORE_USERS
-    IGNORE_USERS = get_banned_users()
-    await interaction.followup.send(f"✅ Пользователь {uid} добавлен в чёрный список.")
-    await send_log(f"Забанен пользователь Telegram {uid} (slash)", "INFO")
+    if uid not in IGNORE_USERS:
+        IGNORE_USERS.append(uid)
+        await interaction.followup.send(f"✅ Пользователь {uid} добавлен в чёрный список.")
+        await send_log(f"Забанен пользователь Telegram {uid} (slash)", "INFO")
+    else:
+        await interaction.followup.send(f"⚠️ Пользователь {uid} уже в чёрном списке.")
 
 @discord_client.tree.command(name="unban", description="Разбанить пользователя Telegram")
 async def slash_unban(interaction: discord.Interaction, user_id: str):
     await interaction.response.defer(ephemeral=False)
+    global IGNORE_USERS
     if not interaction.user.guild_permissions.administrator:
         await interaction.followup.send("❌ Недостаточно прав.", ephemeral=True)
         return
@@ -534,11 +492,12 @@ async def slash_unban(interaction: discord.Interaction, user_id: str):
     except ValueError:
         await interaction.followup.send("❌ ID должен быть числом.", ephemeral=True)
         return
-    remove_banned_user(uid)
-    global IGNORE_USERS
-    IGNORE_USERS = get_banned_users()
-    await interaction.followup.send(f"✅ Пользователь {uid} удалён из чёрного списка.")
-    await send_log(f"Разбанен пользователь Telegram {uid} (slash)", "INFO")
+    if uid in IGNORE_USERS:
+        IGNORE_USERS.remove(uid)
+        await interaction.followup.send(f"✅ Пользователь {uid} удалён из чёрного списка.")
+        await send_log(f"Разбанен пользователь Telegram {uid} (slash)", "INFO")
+    else:
+        await interaction.followup.send(f"⚠️ Пользователь {uid} не найден в чёрном списке.")
 
 # ---------- Основная логика Telegram ----------
 async def telegram_to_discord(update: Update, context: TGContext):
@@ -550,8 +509,7 @@ async def telegram_to_discord(update: Update, context: TGContext):
     if not msg or msg.from_user.is_bot:
         return
 
-    # Проверка чёрного списка (из БД)
-    if msg.from_user.id in get_banned_users():
+    if msg.from_user.id in IGNORE_USERS:
         return
 
     if ALLOWED_USERS and msg.from_user.id not in ALLOWED_USERS:
@@ -624,28 +582,32 @@ async def tg_stats(update: Update, context: TGContext):
         await update.message.reply_text("❌ Недостаточно прав.")
 
 async def tg_ban(update: Update, context: TGContext):
+    global IGNORE_USERS
     if update.effective_user.id in ADMIN_IDS or not ADMIN_IDS:
         try:
             user_id = int(context.args[0])
-            add_banned_user(user_id)
-            global IGNORE_USERS
-            IGNORE_USERS = get_banned_users()
-            await update.message.reply_text(f"✅ Пользователь {user_id} забанен.")
-            await send_log(f"Забанен пользователь Telegram {user_id} (команда /ban)", "INFO")
+            if user_id not in IGNORE_USERS:
+                IGNORE_USERS.append(user_id)
+                await update.message.reply_text(f"✅ Пользователь {user_id} забанен.")
+                await send_log(f"Забанен пользователь Telegram {user_id} (команда /ban)", "INFO")
+            else:
+                await update.message.reply_text(f"⚠️ Пользователь {user_id} уже в бане.")
         except (IndexError, ValueError):
             await update.message.reply_text("❌ Использование: /ban <user_id>")
     else:
         await update.message.reply_text("❌ Недостаточно прав.")
 
 async def tg_unban(update: Update, context: TGContext):
+    global IGNORE_USERS
     if update.effective_user.id in ADMIN_IDS or not ADMIN_IDS:
         try:
             user_id = int(context.args[0])
-            remove_banned_user(user_id)
-            global IGNORE_USERS
-            IGNORE_USERS = get_banned_users()
-            await update.message.reply_text(f"✅ Пользователь {user_id} разбанен.")
-            await send_log(f"Разбанен пользователь Telegram {user_id} (команда /unban)", "INFO")
+            if user_id in IGNORE_USERS:
+                IGNORE_USERS.remove(user_id)
+                await update.message.reply_text(f"✅ Пользователь {user_id} разбанен.")
+                await send_log(f"Разбанен пользователь Telegram {user_id} (команда /unban)", "INFO")
+            else:
+                await update.message.reply_text(f"⚠️ Пользователь {user_id} не в бане.")
         except (IndexError, ValueError):
             await update.message.reply_text("❌ Использование: /unban <user_id>")
     else:
@@ -672,7 +634,6 @@ async def run_telegram():
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).request(request).build()
 
-    # Сначала добавляем команды, потом общий обработчик (не команд)
     tg_app.add_handler(CommandHandler("pause", tg_pause))
     tg_app.add_handler(CommandHandler("resume", tg_resume))
     tg_app.add_handler(CommandHandler("stats", tg_stats))
@@ -706,11 +667,6 @@ async def run_telegram():
         await tg_app.shutdown()
 
 async def main():
-    # Инициализируем БД при старте
-    init_db()
-    global IGNORE_USERS
-    IGNORE_USERS = get_banned_users()
-
     discord_task = asyncio.create_task(run_discord())
     telegram_task = asyncio.create_task(run_telegram())
 
